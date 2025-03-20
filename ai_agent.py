@@ -187,26 +187,35 @@ def retrieve_search_node(state: AgentState) -> Command:
     result = retrieve_search_agent.invoke(state)
     # 내부 retrieval 결과를 상태에 저장
     state["retrieve_result"] = result['messages'][-1].content
-    
+
     # 사용자 쿼리를 state에서 추출 (첫 번째 메시지가 HumanMessage라고 가정)
     user_query = state["messages"][0]["content"]
     # retriever를 직접 호출하여 Document 리스트를 가져옴
     docs = retriever.invoke(user_query)
     
+    # state에 이미지가 이미 설정되어 있다면 해당 이미지를 사용하고,
+    # 그렇지 않은 경우에만 문서 metadata에서 이미지를 추출합니다.
     displayed_image = None
-    for doc in docs:
-        meta = doc.metadata
-        if "image_paths" in meta and meta["image_paths"]:
-            try:
-                # image_paths는 json.dumps로 저장되어 있으므로 디코딩
-                image_paths = json.loads(meta["image_paths"])
-            except Exception:
-                image_paths = meta["image_paths"]
-            if isinstance(image_paths, list) and len(image_paths) > 0:
-                displayed_image = image_paths[0]
-                break
+    if "image" in state and state["image"]:
+        displayed_image = state["image"]
+    else:
+        for doc in docs:
+            meta = doc.metadata
+            if "image_paths" in meta and meta["image_paths"]:
+                try:
+                    # image_paths는 json.dumps로 저장되어 있으므로 디코딩
+                    image_paths = json.loads(meta["image_paths"])
+                except Exception:
+                    image_paths = meta["image_paths"]
+                if isinstance(image_paths, list) and len(image_paths) > 0:
+                    displayed_image = image_paths[0]
+                    break
+
     # retrieval 결과 앞에 이미지 링크(존재할 경우) 추가
-    state["retrieve_result"] = (displayed_image or "") + '\n\n' + state["retrieve_result"] + "\n"
+    if displayed_image:
+        state["retrieve_result"] = displayed_image + '\n\n' + state["retrieve_result"] + "\n"
+    else:
+        state["retrieve_result"] = state["retrieve_result"] + "\n"
     
     # 기존 messages 리스트에 retrieval 결과를 추가
     state.setdefault("messages", []).append(

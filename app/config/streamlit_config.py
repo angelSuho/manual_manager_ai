@@ -7,8 +7,7 @@ def apply_streamlit_settings():
     st.set_page_config(
         page_title="KCC Auto Manager",
         page_icon=Image.open(IMAGE_PATH + "/favicon.ico"),
-        layout="wide"
-    )
+        layout="wide")
 
 def apply_custom_css():
     st.markdown("""

@@ -1,13 +1,13 @@
-import os, base64, re, time
+import os, base64, re, time, markdown, html
 import torch
 import numpy as np
 import cv2
 from PIL import Image
 from transformers import CLIPProcessor, CLIPModel
 
-from config.config import IMAGE_PATTERN, client
+from config.config import IMAGE_PATTERN, client, st
 from config import streamlit_config
-from services.ai_service import ask_lang_graph_agent, st, summarize_text
+from services.ai_service import ask_lang_graph_agent, summarize_text
 from services.tts_service import generate_tts
 
 streamlit_config.apply_streamlit_settings()
@@ -57,7 +57,7 @@ st.markdown('<div class="fixed-header"><h3 style="margin:0; padding-bottom: 7px;
 def load_clip_model():
     clip_model_name = "openai/clip-vit-base-patch32"
     model = CLIPModel.from_pretrained(clip_model_name)
-    processor = CLIPProcessor.from_pretrained(clip_model_name)
+    processor = CLIPProcessor.from_pretrained(clip_model_name, use_fast=True)
     return model, processor
 
 # 흐림(블러) 여부 판정 함수 (OpenCV 사용)
@@ -189,17 +189,10 @@ def handle_user_input(user_prompt=None, audio_file=None):
                     related_image = match.group(0)
                     assistant_response = re.sub(IMAGE_PATTERN, '', assistant_response, count=1, flags=re.IGNORECASE)
                 
-                # 스트리밍 형식으로 한 글자씩 출력
-                streaming_placeholder = st.empty()
-                displayed_text = ""
-                for char in assistant_response:
-                    displayed_text += char
-                    streaming_placeholder.markdown(f"<div class='bot-message'>{displayed_text}</div>", unsafe_allow_html=True)
-                    time.sleep(0.005)
-
+                assistant_response = markdown.markdown(assistant_response)
+                st.markdown(f"<div class='bot-message'>{assistant_response}</div>", unsafe_allow_html=True)
                 if related_image:
                     st.image(related_image, width=500)
-                
                 with st.spinner("TTS 생성 중입니다..."):
                     # 수정 코드:
                     if assistant_response.strip():

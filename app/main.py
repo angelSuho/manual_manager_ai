@@ -1,10 +1,13 @@
-from services.ai_service import st, car_types
+from config.config import st, car_types
+from config import streamlit_config
+import torch
 
-st.set_page_config(page_title="KCC Auto Manager", layout="wide")
+streamlit_config.apply_streamlit_settings()
 
 st.markdown("<h2 style='text-align:center;'>🚗 Where would you like to go?</h2>", unsafe_allow_html=True)
 st.markdown("<p style='text-align:center;'>Explore your travel opportunities with us!</p>", unsafe_allow_html=True)
 
+torch.classes.__path__ = []
 for i in range(0, len(car_types), 3):
     cols = st.columns([1, 0.2, 1, 0.2, 1])
 

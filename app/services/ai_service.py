@@ -5,7 +5,6 @@ from langgraph.graph import StateGraph, START, END
 from langchain_core.messages import HumanMessage
 from langchain.tools import tool
 from typing import List
-import streamlit as st  # Streamlit 라이브러리 임포트
 
 ## image similarity finder
 import cv2
@@ -19,6 +18,8 @@ import re
 from langchain.chains.summarize import load_summarize_chain
 from langchain.docstore.document import Document
 from langchain.prompts import PromptTemplate
+from langchain_openai import OpenAIEmbeddings
+from langchain_pinecone import PineconeVectorStore
 
 from typing import List, Optional
 from typing_extensions import TypedDict
@@ -34,35 +35,22 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.types import Command
 from typing import Literal
 
-from config.config import IMAGE_PATTERN
-from services.embedding_service import database
+from config.config import IMAGE_PATTERN, st
+from services.embedding_service import index_data
 
 # ==========================================
 # 설정 및 초기화
 # ==========================================
 load_dotenv()
-index_name = "benz-eqs"
-car_types = [
-    {"name": "EQS", "image": "./data/images/eqs.png"},
-    {"name": "S-Class", "image": "./data/images/s-class.png"},
-    {"name": "E-Class", "image": "./data/images/e-class.png"},
-    {"name": "GLA", "image": "./data/images/gla.png"},
-    {"name": "GLC", "image": "./data/images/glc.png"},
-    {"name": "EQE", "image": "./data/images/eqe.png"},
-    {"name": "C-Class", "image": "./data/images/c-class.png"},
-    {"name": "A-Class", "image": "./data/images/a-class.png"},
-    {"name": "AMG GT", "image": "./data/images/amg-gt.png"},
-]
 
 model = "gpt-4o"
-
-retriever = database.as_retriever(search_kwargs={"k": 3})
 llm = ChatOpenAI(model=model)
+embedding = OpenAIEmbeddings(model="text-embedding-3-large") # text-embedding-ada-002, text-embedding-3-large
 
 class AgentState(TypedDict, total=False):
     messages: List[HumanMessage]
     image: Optional[str]
-
+    index: str
 
 # --- 요약 함수 추가 ---
 def summarize_text(text):
@@ -217,102 +205,113 @@ def service_center_search_node(state: AgentState) -> Command:
 # 여기 **위쪽**에 있던 `retrieve_or_image_node`는 제거하거나 주석 처리하고,
 # **이 아래쪽**의 함수만 사용!
 def routing_node(state: AgentState) -> Command[Literal["retrieve_search", "image_search", "service_center_search"]]:
-    user_query = state["messages"][0]["content"]
+    try:
+        user_query = state["messages"][0]["content"]
+        state["index"] = None
+        state["index"] = index_data()
+        
+        # 0) "가까운 서비스 센터" 키워드 감지
+        if ("가까운 서비스 센터" in user_query) or ("근처 서비스 센터" in user_query):
+            return Command(update={'messages': state['messages']}, goto="service_center_search")
 
-    # 0) "가까운 서비스 센터" 키워드 감지
-    if ("가까운 서비스 센터" in user_query) or ("근처 서비스 센터" in user_query):
-        return Command(update={'messages': state['messages']}, goto="service_center_search")
+        # 1) 이미지 체크
+        match = re.search(IMAGE_PATTERN, user_query, flags=re.IGNORECASE)
+        if match:
+            image_url = match.group(0)
+            updated_query = re.sub(IMAGE_PATTERN, '', user_query, count=1, flags=re.IGNORECASE).strip()
+            state["messages"][0]["content"] = updated_query
+            state["image"] = image_url
+            return Command(update={'messages': state['messages'], 'image': state['image'], 'index': state['index']}, goto="image_search")
 
-    # 1) 이미지 체크
-    match = re.search(IMAGE_PATTERN, user_query, flags=re.IGNORECASE)
-    if match:
-        image_url = match.group(0)
-        updated_query = re.sub(IMAGE_PATTERN, '', user_query, count=1, flags=re.IGNORECASE).strip()
-        state["messages"][0]["content"] = updated_query
-        state["image"] = image_url
-        return Command(update={'messages': state['messages'], 'image': state['image']}, goto="image_search")
-
-    # 2) 그 외는 text search
-    return Command(update={'messages': state['messages']}, goto="retrieve_search")
+        # 2) 그 외는 text search
+        return Command(update={'messages': state['messages'], 'index': state['index']}, goto="retrieve_search")
+    except Exception as e:
+        st.error(f"라우팅 노드에서 에러가 발생했습니다. 다시 시도해주세요. {e}")
 
 
 def image_search_node(state: AgentState) -> Command:
-    target_image_path = state["image"]
-    target_image = Image.open(target_image_path).convert("RGB")
+    try:
+        target_image_path = state["image"]
+        target_image = Image.open(target_image_path).convert("RGB")
 
-    # 저장된 아이콘 이미지 임베딩 로딩 또는 계산 함수
-    def compute_and_save_embeddings():
-        embeddings = {}
-        for filename in os.listdir(icon_folder):
-            if not filename.lower().endswith((".png", ".jpg", ".jpeg")):
-                continue
-            image_path = os.path.join(icon_folder, filename)
-            # imread_unicode와 resize_image는 사용자의 이미지 전처리 함수라고 가정합니다.
-            img_cv = imread_unicode(image_path)
-            if img_cv is None:
-                continue
-            img_cv = resize_image(img_cv, max_dim=500)
-            # 이미지 전처리 (PIL 이미지로 변환 후 CLIP 전처리)
-            img_pil = Image.fromarray(cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB))
-            input_tensor = preprocess(img_pil).unsqueeze(0).to(device)
-            with torch.no_grad():
-                embedding = model.encode_image(input_tensor)
-            embedding /= embedding.norm(dim=-1, keepdim=True)
-            embeddings[filename] = embedding.cpu()  # CPU로 이동하여 저장
-        # 임베딩 저장 (pickle 사용)
-        with open(embeddings_path, "wb") as f:
-            pickle.dump(embeddings, f)
-        
-    def load_embeddings():
-        if os.path.exists(embeddings_path):
-            with open(embeddings_path, "rb") as f:
-                embeddings = pickle.load(f)
-            return embeddings
-        else:
-            return None
+        # 저장된 아이콘 이미지 임베딩 로딩 또는 계산 함수
+        def compute_and_save_embeddings():
+            embeddings = {}
+            for filename in os.listdir(icon_folder):
+                if not filename.lower().endswith((".png", ".jpg", ".jpeg")):
+                    continue
+                image_path = os.path.join(icon_folder, filename)
+                # imread_unicode와 resize_image는 사용자의 이미지 전처리 함수라고 가정합니다.
+                img_cv = imread_unicode(image_path)
+                if img_cv is None:
+                    continue
+                img_cv = resize_image(img_cv, max_dim=500)
+                # 이미지 전처리 (PIL 이미지로 변환 후 CLIP 전처리)
+                img_pil = Image.fromarray(cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB))
+                input_tensor = preprocess(img_pil).unsqueeze(0).to(device)
+                with torch.no_grad():
+                    embedding = model.encode_image(input_tensor)
+                embedding /= embedding.norm(dim=-1, keepdim=True)
+                embeddings[filename] = embedding.cpu()  # CPU로 이동하여 저장
+            # 임베딩 저장 (pickle 사용)
+            with open(embeddings_path, "wb") as f:
+                pickle.dump(embeddings, f)
+            
+        def load_embeddings():
+            if os.path.exists(embeddings_path):
+                with open(embeddings_path, "rb") as f:
+                    embeddings = pickle.load(f)
+                return embeddings
+            else:
+                return None
 
-    # 저장된 임베딩이 없다면 계산하고 저장
-    icon_embeddings = load_embeddings()
-    if icon_embeddings is None:
-        compute_and_save_embeddings()
+        # 저장된 임베딩이 없다면 계산하고 저장
         icon_embeddings = load_embeddings()
+        if icon_embeddings is None:
+            compute_and_save_embeddings()
+            icon_embeddings = load_embeddings()
 
-    # 타겟 이미지 전처리 및 임베딩 추출, 정규화
-    target_input = preprocess(target_image).unsqueeze(0).to(device)
-    with torch.no_grad():
-        target_embedding = model.encode_image(target_input) 
-    target_embedding /= target_embedding.norm(dim=-1, keepdim=True)
+        # 타겟 이미지 전처리 및 임베딩 추출, 정규화
+        target_input = preprocess(target_image).unsqueeze(0).to(device)
+        with torch.no_grad():
+            target_embedding = model.encode_image(target_input) 
+        target_embedding /= target_embedding.norm(dim=-1, keepdim=True)
 
-    # 저장된 임베딩과 타겟 이미지 간의 유사도 계산
-    results = []
-    for filename, embedding in icon_embeddings.items():
-        # 각 임베딩은 [1, D] 형태이므로 내적을 통해 코사인 유사도를 계산
-        similarity = (target_embedding.cpu() @ embedding.T).item()
-        results.append((filename, similarity))
+        # 저장된 임베딩과 타겟 이미지 간의 유사도 계산
+        results = []
+        for filename, embedding in icon_embeddings.items():
+            # 각 임베딩은 [1, D] 형태이므로 내적을 통해 코사인 유사도를 계산
+            similarity = (target_embedding.cpu() @ embedding.T).item()
+            results.append((filename, similarity))
 
-    # 유사도 내림차순 정렬
-    results.sort(key=lambda x: x[1], reverse=True)
-    state["image"] = results[0][0]
+        # 유사도 내림차순 정렬
+        results.sort(key=lambda x: x[1], reverse=True)
+        state["image"] = results[0][0]
 
-    # state에 추가된 정보를 포함하여 업데이트된 state를 반환
-    return Command(update=state)
+        # state에 추가된 정보를 포함하여 업데이트된 state를 반환
+        return Command(update=state)
+    except Exception as e:
+        st.error(f"이미지 검색 노드에서 에러가 발생했습니다. 다시 시도해주세요. {e}")
 
 @tool
-def vector_retrieve_tool(query: str) -> List[Document]:
+def vector_retrieve_tool(query: str, index: str) -> List[Document]:
     """Retrieve documents based on the given query."""
-    return retriever.invoke(query)
+    database = PineconeVectorStore(index_name=index, embedding=embedding)
+    return database.as_retriever(search_kwargs={"k": 3}).invoke(query)
 
 def dynamic_state_modifier(agent_input: AgentState) -> str:
     image_val = agent_input.get("image")
     image_line = f"The Topic of the provided target image is {image_val}. " if image_val and image_val != "no_image" else ""
     car_type = st.session_state.get("car_type", "EQS")
+    index = agent_input.get("index", "eqs")
     return (
         f"""
-        You are a highly experienced professional specializing in Mercedes Benz {car_type} car manuals. {image_line}
+        You are a highly experienced professional specializing in Mercedes Benz {car_type} car manuals. 
+        {image_line}
+        The name of the 'index' is {index}, which examines the information in this index.
         Based solely on the provided information, please deliver a well-researched and fact-based answer—free from personal opinions.
-        Translate the answer into Korean and ensure that each section is clearly formatted on a separate line, as described below.
+        Translate the answer into Korean and ensure that each section is clearly formatted on a separate line, as described below.\
         
-
         ## {{제목}}
         - Provide a concise yet precise title that encapsulates the key feature or function.
         (Example: "Driver Display Charge Status Window Function")
@@ -329,89 +328,102 @@ def dynamic_state_modifier(agent_input: AgentState) -> str:
     )
 
 def retrieve_search_node(state: AgentState) -> Command:
-    retrieve_search_agent = create_react_agent(
-        llm,
-        tools=[vector_retrieve_tool],
-        state_modifier=dynamic_state_modifier(state)  # 함수로 교체
-    )
-    result = retrieve_search_agent.invoke(state)
-    # 내부 retrieval 결과를 상태에 저장
-    state["retrieve_result"] = result['messages'][-1].content
-    
-    # 기존 messages 리스트에 retrieval 결과를 추가
-    state.setdefault("messages", []).append(
-        HumanMessage(content=state["retrieve_result"], name="retrieve_search")
-    )
-    # 전체 messages 리스트를 업데이트
-    return Command(update={'messages': state["messages"]})
+    try:
+        st.session_state.car_type = state["index"]
+        retrieve_search_agent = create_react_agent(
+            llm,
+            tools=[vector_retrieve_tool],
+            state_modifier=dynamic_state_modifier(state)  # 함수로 교체
+        )
+        result = retrieve_search_agent.invoke(state)
+        # 내부 retrieval 결과를 상태에 저장
+        state["retrieve_result"] = result['messages'][-1].content
+        
+        # 기존 messages 리스트에 retrieval 결과를 추가
+        state.setdefault("messages", []).append(
+            HumanMessage(content=state["retrieve_result"], name="retrieve_search")
+        )
+        # 전체 messages 리스트를 업데이트
+        return Command(update={'messages': state["messages"]})
+    except Exception as e:
+        st.error(f"retrieve 노드에서 에러가 발생했습니다. 다시 시도해주세요. {e}")
 
 def evaluate_node(state: AgentState) -> Command[Literal['web_search', END]]:
-    retrieve_result = state["messages"][-1].content
-    
-    if retrieve_result == "":
-        st.write("검색 결과가 없습니다. 웹 검색을 시도합니다.")
-        return Command(goto='web_search')
-    
-    car_type = st.session_state.get("car_type", "EQS")
-    # retrieval 결과가 충분할 수 있으므로 LLM 평가 프롬프트 실행
-    eval_prompt = PromptTemplate.from_template(
-        "You are an expert on Mercedes Benz " + car_type + " car manuals."
-        "Please rate if the retrive results below provide sufficient answers."
-        "You must assess that the answers or answers of more than 200 characters are sufficiently consistent with your question."
-        "If you don't have enough information to judge, or if you don't provide it in your answer, answer 'yes', and answer no if enough is enough.\n\n"
-        "Retrieve Results:\n{result}"
-    )
-    eval_chain = eval_prompt | llm
-    evaluation = eval_chain.invoke({"result": state.get("retrieve_result")})
-    if "yes" in evaluation.content.lower():
-        st.write("답변이 충분하지 않습니다. 웹 검색을 시도합니다.")
-        return Command(goto='web_search')
-    else:
-        return Command(goto=END)
+    try:
+        retrieve_result = state["messages"][-1].content
+        
+        if retrieve_result == "":
+            st.write("검색 결과가 없습니다. 웹 검색을 시도합니다.")
+            return Command(goto='web_search')
+        
+        car_type = st.session_state.get("car_type", "EQS")
+        # 2) 평가 프롬프트 (명확히 'yes'/'no'만 출력하도록 지시)
+        eval_prompt = PromptTemplate.from_template(
+
+            f"""You are an expert on Mercedes Benz {car_type} car manuals.
+        Please evaluate the following retrieved results for completeness and relevance.
+        If the retrieved content is less than 500 characters, or if it does not comprehensively address the user's query with detailed technical information, respond with exactly "yes". Otherwise, respond with exactly "no".
+        You must respond with one word only, either "yes" or "no", with no additional commentary.
+        Retrieve Results:
+        {{result}}
+        """
+        
+        )
+        eval_chain = eval_prompt | llm
+        evaluation = eval_chain.invoke({"result": state.get("retrieve_result")})
+        if "yes" in evaluation.content.lower():
+            st.write("답변이 충분하지 않습니다. 웹 검색을 시도합니다.")
+            return Command(goto='web_search')
+        else:
+            return Command(goto=END)
+    except Exception as e:
+        st.error(f"evaluate 노드에서 에러가 발생했습니다. 다시 시도해주세요. {e}")
 
 def web_search_node(state: AgentState) -> Command:
-    tavily_search_tool = TavilySearchResults(
-        max_results=5,
-        search_depth="advanced",
-        include_answer=True,
-        include_raw_content=True,
-        include_images=True,
-    )
-
-    car_type = st.session_state.get("car_type", "EQS")
-    web_search_agent = create_react_agent(
-        llm, 
-        tools=[tavily_search_tool],
-        state_modifier = (f"""
-            You are a highly experienced professional specializing in Mercedes Benz {car_type} car manuals.
-            Based solely on the provided website information, please generate a comprehensive, fact-based, and detailed response.
-            Your answer must be fully translated into Korean, free from personal opinions, and organized using the structure below.
-            **Do not include any image references or display any images in your answer, even if they appear in the source information.**
-            
-            
-            ## {{제목}}
-            - Provide a concise title that encapsulates the key feature or function.
-            (Example: 'Driver Display Charge Status Window Function')
-
-            ### {{상세 설명}}
-            - Deliver a thorough explanation of the feature, including technical details, benefits, and practical usage instructions.
-            - If applicable, include any relevant references or source information from the website.
-            - IMPORTANT: At the very end of your answer, on a new line, include the actual source URL extracted from the provided website information.
-            Format it exactly as:
-            [출처: 실제_출처_URL]
-            (Replace 실제_출처_URL with the actual URL found in the source; do not use a placeholder.)
-            
-            Please ensure that each section is clearly separated by new lines and that the final answer is presented in an organized and professional manner in Korean.
-            """
+    try:
+        tavily_search_tool = TavilySearchResults(
+            max_results=5,
+            search_depth="advanced",
+            include_answer=True,
+            include_raw_content=True,
+            include_images=True,
         )
-    )
 
-    result = web_search_agent.invoke(state)
-    state["web_result"] = result['messages'][-1].content
-    state.setdefault("messages", []).append(
-        HumanMessage(content=state["web_result"], name="web_search")
-    )
-    return Command(update={'messages': state["messages"]})
+        car_type = st.session_state.get("car_type", "EQS")
+        web_search_agent = create_react_agent(
+            llm, 
+            tools=[tavily_search_tool],
+            state_modifier = (f"""
+                You are a highly experienced professional specializing in Mercedes Benz {car_type} car manuals.
+                Based solely on the provided website information, please generate a comprehensive, fact-based, and detailed response.
+                Your answer must be fully translated into Korean, free from personal opinions, and organized using the structure below.
+                **Do not include any image references or display any images in your answer, even if they appear in the source information.**\
+                
+                ## {{제목}}
+                - Provide a concise title that encapsulates the key feature or function.
+                (Example: 'Driver Display Charge Status Window Function')
+
+                ### {{상세 설명}}
+                - Deliver a thorough explanation of the feature, including technical details, benefits, and practical usage instructions.
+                - If applicable, include any relevant references or source information from the website.
+                - IMPORTANT: At the very end of your answer, on a new line, include the actual source URL extracted from the provided website information.
+                Format it exactly as:
+                [출처: 실제_출처_URL]
+                (Replace 실제_출처_URL with the actual URL found in the source; do not use a placeholder.)
+                
+                Please ensure that each section is clearly separated by new lines and that the final answer is presented in an organized and professional manner in Korean.
+                """
+            )
+        )
+
+        result = web_search_agent.invoke(state)
+        state["web_result"] = result['messages'][-1].content
+        state.setdefault("messages", []).append(
+            HumanMessage(content=state["web_result"], name="web_search")
+        )
+        return Command(update={'messages': state["messages"]})
+    except Exception as e:
+        st.error(f"웹 검색 노드에서 에러가 발생했습니다. 다시 시도해주세요. {e}")
 
 # 그래프 구성
 graph_builder = StateGraph(AgentState)

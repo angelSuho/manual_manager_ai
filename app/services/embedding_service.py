@@ -8,14 +8,19 @@ import json  # JSON 파일 처리를 위한 json 모듈 임포트
 
 from langchain_openai import OpenAIEmbeddings
 from langchain_pinecone import PineconeVectorStore
+from config.config import st
 
 load_dotenv()
 
-file_path = "./data/json/"
-index_name = "kcc"
+jsons = [
+    "./data/jsons/mercedes-e-class-sedan-manual.json",
+    "./data/jsons/mercedes-eqs-sedan-manual.json",
+    "./data/jsons/mercedes-gla-suv-manual.json",
+    "./data/jsons/mercedes-s-class-sedan-manual.json",
+]
 
-embedding = OpenAIEmbeddings(model="text-embedding-3-large") #text-embedding-ada-002, text-embedding-3-large
-database = PineconeVectorStore(index_name=index_name, embedding=embedding)
+pinecone_api_key = os.getenv("PINECONE_API_KEY")
+pc = Pinecone(api_key=pinecone_api_key)
 
 # ==========================================
 # Pinecone 인덱스 초기화 및 데이터 인덱싱 함수
@@ -34,7 +39,7 @@ def load_stored_hash(hash_file):
 def save_hash(hash_file, hash_value):
     with open(hash_file, "w", encoding="utf-8") as f:
         f.write(hash_value)
-def index_data():
+def index_data() -> str:
     """
     usage.json 파일의 내용을 읽어와 각 섹션의 하위 항목(서브타이틀) 단위로 문서를 생성하고,
     각 문서에는 아래의 정보가 포함됩니다.
@@ -45,12 +50,32 @@ def index_data():
       - 서브타이틀에서 추출한 이미지 URL 목록 (contents와 images 모두 확인)
     이전에 저장된 해시와 비교하여 변경이 있을 때만 인덱싱을 진행합니다.
     """
-    hash_file = file_path + "test.json.hash"
-    current_hash = get_file_hash(file_path + "test.json")
+    car_type = st.session_state.get("car_type", "EQS")
+    index_name = car_type.lower()
+    st.session_state.car_type = index_name
+
+    if index_name not in [idx.name for idx in pc.list_indexes()]:
+        pc.create_index(
+            name=index_name,
+            dimension=3072,
+            metric="cosine",
+        )
+
+    embedding = OpenAIEmbeddings(model="text-embedding-3-large") # text-embedding-ada-002, text-embedding-3-large
+    database = PineconeVectorStore(index_name=index_name, embedding=embedding)
+
+    target_json = None
+    for json_file in jsons:
+        if index_name in json_file:
+            target_json = json_file
+            break
+
+    hash_file = f"{target_json}.hash"
+    current_hash = get_file_hash(target_json)
     stored_hash = load_stored_hash(hash_file)
     
     if stored_hash != current_hash:
-        json_file = file_path + "test.json"
+        json_file = target_json
         with open(json_file, "r", encoding="utf-8") as f:
             data = json.load(f)
         
@@ -97,16 +122,6 @@ def index_data():
             database.add_documents(documents)
         # 새 해시값 저장 (이후 변경 여부 판단)
         save_hash(hash_file, current_hash)
-
-pinecone_api_key = os.getenv("PINECONE_API_KEY")
-pc = Pinecone(api_key=pinecone_api_key)
-# 인덱스 선정
-if index_name not in [idx.name for idx in pc.list_indexes()]:
-    pc.create_index(
-        name=index_name,
-        dimension=3072,
-        metric="cosine",
-    )
-index = pc.Index(index_name)
+    return index_name
 
 index_data()

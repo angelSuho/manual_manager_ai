@@ -34,8 +34,10 @@ from services.embedding_service import index_data
 # ==========================================
 load_dotenv()
 
-model = "gpt-4o"
-llm = ChatOpenAI(model=model)
+llm_image = "o1"    # o1
+llm_service = ChatOpenAI(model="gpt-4o")
+llm_summarize = ChatOpenAI(model="o3-mini")
+
 embedding = OpenAIEmbeddings(model="text-embedding-3-large") # text-embedding-ada-002, text-embedding-3-large
 
 class AgentState(TypedDict, total=False):
@@ -62,7 +64,7 @@ def summarize_text(text):
     
     # 요약 체인 생성 (map_reduce 체인)
     chain = load_summarize_chain(
-        llm, 
+        llm_summarize, 
         chain_type="map_reduce", 
         map_prompt=map_prompt, 
         combine_prompt=combine_prompt
@@ -198,7 +200,7 @@ def image_search_node(state: AgentState) -> Command[Literal['retrieve_search', E
         car_type = state['index'] if state['index'] else "EQS"
         def generate_image_llm_output(user_question, data_url):
             response = openai.chat.completions.create(
-                model="gpt-4o",
+                model=llm_image,
                 messages=[
                     {
                         "role": "user",
@@ -215,6 +217,7 @@ Follow these instructions exactly:
 4. If a user asks a question about a particular term, feature, or feature in an image, only that term, color, feature, or feature is briefly described.
 5. Translate your final answer entirely into Korean.
 6. Organize your answer in clearly separated sections with new lines for each section.
+- When describing a warning lamp, be sure to use the official name of the warning lamp, e.g. "액티브 브레이크 어시스트".
 
 User's question: "{user_question}"
 ​"""
@@ -243,7 +246,7 @@ User's question: "{user_question}"
     except Exception as e:
         st.error(f"이미지 검색 노드에서 에러가 발생했습니다. 다시 시도해주세요. {e}")
 
-def gen_correction_question(state):
+def gen_correction_question(state, image_line=""):
     st.write("질문을 분석하고 있습니다...")
     car_type = st.session_state.get("car_type", "EQS")
     original_question = state["messages"][-1]["content"]
@@ -252,15 +255,22 @@ def gen_correction_question(state):
         f"""You are an expert in charge of AI explaining Mercedes Benz {car_type} vehicle manual.
 Your role is to calibrate questions so that LLM can understand questions more effectively and find accurate information.
 Don't change the intention of the question, but please improve the expression more accurately and specifically so that LLM can understand it well.
-Please answer the corrected answer in Korean.
+
+Original question: "{original_question}"
+
+Image Analysis Results: "{image_line}"
+
+- Based on the results of the image analysis, please change the general and ambiguous expression (e.g. 노란색 경고등 → specific warning lamp name) in the question more specifically and clearly.
+- Please don't change the original intention of the user, just improve the expression clearly.
+
+Write the corrected questions in Korean only.
 
 User's question: "{{question}}"
-
-a calibrated question:"""
+"""
     )
 
     # LLM을 이용하여 질문 교정 수행
-    correction_chain = correction_prompt | llm
+    correction_chain = correction_prompt | llm_summarize 
     corrected_question = correction_chain.invoke({"question": original_question}).content.strip()
     st.write(f"교정된 질문: {corrected_question}")
     return corrected_question
@@ -283,16 +293,17 @@ Make sure to write in Korean according to the instructions below and separate ea
 
 [Writing structure]
 
-## subject
+### subject
 - Write a concise and accurate title that implies a function or key characteristic.
   (e.g. "Driver Display Charge Status Window Function")
 
-### Description
+#### Description
 - Provide a comprehensive explanation of the questions, including the operating principles, benefits, and technical specifications of the function.
 - The description shall be organized in paragraph or bullet point format, and if the information is presented as a number (e.g., "1".", "2.", etc.), the corresponding numbering format shall remain the same.
 - If you have any relevant examples or references, include them so that the reader has a clear understanding of the features.
 - If there is an image directly related to the information provided, insert the image link alone in a separate line without further explanation.
 - Answers must be based on the information provided and do not include external information or personal opinions.
+- The structure of the source should be in the form of a markdown. You should be able to go to the page by clicking on the corresponding title of the link in the form of a hyperlink.
 
 User's question: 
 "{user_question}"
@@ -300,17 +311,16 @@ User's question:
 
 def retrieve_search_node(state: AgentState) -> Command:
     try:
-        st.write("내부 데이터를 검색하는중입니다...")
         car_type = state["index"]
         if state["image"]:
             image_val = state["image"]
             image_line = f"\n\nThe description of the accompanying image is as follows: '{image_val}' " if image_val and image_val != "no_image" else ""
         else:
             image_line = ""
-        # 교정된 질문과 이미지 검색 결과를 상태에 저장
-        corrected_question = gen_correction_question(state)
-        state["messages"][-1]["content"] = corrected_question + image_line
+        corrected_question = gen_correction_question(state, image_line)
+        state["messages"][-1]["content"] = corrected_question
 
+        st.write("내부 데이터를 검색하는중입니다...")
         retrieve_prompt = gen_retrieve_prompt(
             car_type=car_type,
             image_line=image_line,
@@ -318,7 +328,7 @@ def retrieve_search_node(state: AgentState) -> Command:
             index=car_type
         )
         retrieve_search_agent = create_react_agent(
-            llm,
+            llm_service,
             tools=[vector_retrieve_tool],
             state_modifier=retrieve_prompt,
         )
@@ -389,7 +399,7 @@ Exception:
 Final Answer:
 Be sure to output the final result as "yes" or "no" in just one word after the evaluation."""
 )
-        eval_chain = eval_prompt | llm
+        eval_chain = eval_prompt | llm_service 
         evaluation = eval_chain.invoke({"result": state.get("retrieve_result")})
 
         if "yes" in evaluation.content.lower():
@@ -405,8 +415,8 @@ def web_search_node(state: AgentState) -> Command:
         if "타이어" in state["messages"][-1].content and "펑크" in state["messages"][-1].content:
             time.sleep(5)
             state["messages"][-1].content = """
-## 타이어 펑크 시 안내사항
-### EQS의 펑크난 타이어를 교체하려면 다음 단계를 따르세요. 
+### 타이어 펑크 시 안내사항
+#### EQS의 펑크난 타이어를 교체하려면 다음 단계를 따르세요. 
 1. 안전한 곳으로 차를 세우세요.
 2. 예비 타이어와 도구를 찾으세요.
 3. 러그 너트를 풀어주세요.
@@ -419,7 +429,7 @@ def web_search_node(state: AgentState) -> Command:
 - 구체적인 지침은 사용 설명서를 참조하세요. 
 [출처: [What To Do If You Get A Flat Tire](https://www.mbprinceton.com/what-to-do-if-you-get-a-flat-tire/)]
 
-### 추가 팁
+#### 추가 팁
 - 타이어 교체에 불편함을 느끼신다면 도로변 지원 서비스에 전화하세요. 
 - 차량에 런플랫 타이어가 장착된 경우 타이어에 있는 정보와 경고 사항을 따라야 합니다. 
 - 차량에 확장 이동성 타이어 또는 타이어 장착 이동성 키트가 있는 경우 해당 안전 절차를 따라야 합니다. 
@@ -440,7 +450,7 @@ def web_search_node(state: AgentState) -> Command:
 
         car_type = st.session_state.get("car_type", "EQS")
         web_search_agent = create_react_agent(
-            llm, 
+            llm_service , 
             tools=[tavily_search_tool],
             state_modifier = (f"""
 You are a highly experienced professional specializing in Mercedes Benz {car_type} car manuals.
@@ -454,16 +464,16 @@ Your answer must be fully translated into Korean, free from personal opinions, a
 If you need to provide maintenance information, please refer to AUTODOC's maintenance site:
 - https://club.autodoc.co.uk/manuals
 
-## {{제목}}
+### subject
 - Provide a concise title that encapsulates the key feature or function.
 (Example: 'Driver Display Charge Status Window Function')
 
-### {{상세 설명}}
+#### Description
 - Deliver a thorough explanation of the feature, including technical details, benefits, and practical usage instructions.
 - If applicable, include any relevant references or source information from the website.
 - **Important**: **After each knowledge is found in the URL, when writing the site URL where the knowledge was found in the answer, it must be added after that knowledge**.
 At this point, the URL must have a site accessible to the user and accessible to view internal content.Format it exactly as:
-[출처: 실제_출처_URL]
+[출처: [출처 이름](실제 출처 URL)]
 (Replace 실제_출처_URL with the actual URL found in the source; do not use a placeholder.)
 
 Please make sure to include the URL of the website where you found the answer in your answer.
@@ -515,3 +525,4 @@ def ask_lang_graph_agent(user_prompt, image_url=None, conversation_history=None)
     messages = conversation_history if conversation_history else []
     messages.append({"role": "user", "content": user_prompt})
     return graph.invoke({"messages": messages, "image": image_url})
+        

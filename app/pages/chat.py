@@ -1,4 +1,4 @@
-import base64, re, markdown
+import base64, re, markdown, random
 import torch
 
 from config.config import IMAGE_PATTERN, client, st
@@ -6,6 +6,9 @@ from config import streamlit_config
 from services.ai_service import ask_lang_graph_agent, summarize_text
 from services.tts_service import generate_tts
 from streamlit_current_location import current_position
+
+import folium
+from streamlit_folium import st_folium
 
 streamlit_config.apply_streamlit_settings()
 streamlit_config.apply_custom_css()
@@ -21,6 +24,11 @@ position = current_position()
 if position is not None:
     # 세션에 위치 저장 (키 이름은 "user_location" 등으로 자유롭게 지정)
     st.session_state["user_location"] = position
+    m = folium.Map(location=[position["latitude"], position["longitude"]], zoom_start=16)
+    folium.Marker(
+        [position["latitude"], position["longitude"]], popup="Liberty Bell", tooltip="Liberty Bell"
+    ).add_to(m)
+    st.session_state['map'] = m
 
 # URL 쿼리 파라미터 추출 (st.query_params 사용)
 params = st.query_params
@@ -204,7 +212,7 @@ def display_messages():
                 st.markdown(
                     f"""
                     <div>
-                        <img src='data:image/png;base64,{msg['image']}' class='custom-image' style='float:right; margin-top:8px; width:300px;'/>
+                        <img src='data:image/png;base64,{msg['image']}' class='custom-image' style='float:right; margin-top:8px; width:400px;'/>
                     </div>
                     """,
                     unsafe_allow_html=True
@@ -215,6 +223,9 @@ def display_messages():
                 content_html += f"<br><img src='{msg['image']}' width='500' style='margin-top:8px;'/>"
             content_html += "</div>"
             st.markdown(content_html, unsafe_allow_html=True)
+            if msg.get("map"):
+                st_folium(msg["map"], width=500, height=300, returned_objects=[], key=random.randint(0, 10000))
+
             
             # 오디오 플레이어
             if "tts" in msg and msg["tts"]:
@@ -255,7 +266,7 @@ def handle_user_input(user_prompt=None, audio_file=None):
         if st.session_state.get("uploaded_image"):
             st.markdown(
                 f"<div style='display:flex;justify-content:flex-end;'>"
-                f"<img src='data:image/png;base64,{base64.b64encode(st.session_state.uploaded_image.getvalue()).decode()}' width='300'/></div><br>",
+                f"<img src='data:image/png;base64,{base64.b64encode(st.session_state.uploaded_image.getvalue()).decode()}' width='400'/></div><br>",
                 unsafe_allow_html=True
             )
 
@@ -291,6 +302,8 @@ def handle_user_input(user_prompt=None, audio_file=None):
             st.markdown(f"<div class='bot-message' style='width:700px;'>{assistant_response}</div>", unsafe_allow_html=True)
             if related_image:
                 st.image(related_image, width=500)
+            if "카카오맵" in assistant_response:
+                st_folium(st.session_state['map'], width=500, height=300, returned_objects=[], key=random.randint(0, 10000))
             
             # TTS 생성
             with st.spinner("TTS 생성 중입니다..."):
@@ -312,7 +325,8 @@ def handle_user_input(user_prompt=None, audio_file=None):
                 "role": "assistant",
                 "content": assistant_response,
                 "tts": tts_audio_b64,
-                "image": related_image
+                "image": related_image,
+                "map": st.session_state['map'] if "카카오맵" in assistant_response else None
             })
 
         except Exception as e:
